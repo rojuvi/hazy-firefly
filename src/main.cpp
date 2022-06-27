@@ -1,31 +1,37 @@
 #define MQTT_MAX_PACKET_SIZE 512
-#define DEEP_SLEEP_TIME 1e6
+#define DEEP_SLEEP_SECONDS 1e6
 #define SEALEVELPRESSURE_HPA (1013.25)
 #define BMP280 0
 #define BME280 1
+#define DHTXX 2
 
-#define ROOM_CALIBRATION_EEPROM_INDEX 0
-#define ROOM_FREQUENCY_EEPROM_INDEX 4
+// DHTTYPE and DHTPIN are only used when selected sensor type is DHT
+#define DHTPIN D1
+#define DHTTYPE DHT11
+//#define DHTTYPE DHT11
+//#define DHTTYPE DHT11
 
 #include <config.h>
 #include <BMP280_DEV.h>
 #include <Adafruit_BME280.h>
+#include <DHT.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <ESP8266WiFi.h>
 #include <Wire.h>
-#include <EEPROM.h>
 
 
 float temperature, pressure, altitude, humidity;
 BMP280_DEV bmp280;
 Adafruit_BME280 bme;
+DHT dht(DHTPIN, DHTTYPE);
 
 // Sensor settings
 String sensorId;
-const int sensor = BMP280;
+const int sensor = DHTXX;
 float calibration = 0.0;
 int frequency = 60;
+bool sensorRead = false;
 String stateTopic;
 String calibrationCmdTopic;
 String frequencyCmdTopic;
@@ -34,6 +40,7 @@ WiFiClient wifiClient;
 PubSubClient client(wifiClient);
 
 void sendMQTTTemperatureDiscoveryMsg() {
+  Serial.println("Sending temperature discovery");
   String discoveryTopic = "homeassistant/sensor/room_sensor_" + sensorId + "/temperature/config";
 
   DynamicJsonDocument doc(MQTT_MAX_PACKET_SIZE);
@@ -55,6 +62,7 @@ void sendMQTTTemperatureDiscoveryMsg() {
 }
 
 void sendMQTTHumidityDiscoveryMsg() {
+  Serial.println("Sending humidity discovery");
   String discoveryTopic = "homeassistant/sensor/room_sensor_" + sensorId + "/humidity/config";
 
   DynamicJsonDocument doc(MQTT_MAX_PACKET_SIZE);
@@ -76,6 +84,7 @@ void sendMQTTHumidityDiscoveryMsg() {
 }
 
 void sendMQTTCalibrationDiscoveryMsg() {
+  Serial.print("Sending calibration discovery");
   String discoveryTopic = "homeassistant/number/room_sensor_" + sensorId + "/calibration/config";
 
   DynamicJsonDocument doc(MQTT_MAX_PACKET_SIZE);
@@ -90,6 +99,8 @@ void sendMQTTCalibrationDiscoveryMsg() {
   doc["max"] = 20;
   doc["step"] = 0.01;
   doc["unit_of_meas"] = "ºC";
+  doc["ret"] = true;
+  doc["qos"] = 1;
   doc["val_tpl"] = "{{ value_json.calibration|default(0) }}";
 
   size_t n = serializeJson(doc, buffer);
@@ -100,6 +111,7 @@ void sendMQTTCalibrationDiscoveryMsg() {
 }
 
 void sendMQTTFrequencyDiscoveryMsg() {
+  Serial.println("Sending frequency discovery");
   String discoveryTopic = "homeassistant/number/room_sensor_" + sensorId + "/frequency/config";
 
   DynamicJsonDocument doc(MQTT_MAX_PACKET_SIZE);
@@ -114,6 +126,8 @@ void sendMQTTFrequencyDiscoveryMsg() {
   doc["max"] = 3600;
   doc["step"] = 1;
   doc["unit_of_meas"] = "s";
+  doc["ret"] = true;
+  doc["qos"] = 1;
   doc["val_tpl"] = "{{ value_json.frequency|default(0) }}";
 
   size_t n = serializeJson(doc, buffer);
@@ -124,6 +138,7 @@ void sendMQTTFrequencyDiscoveryMsg() {
 }
 
 void sendMqttStatus() {
+  Serial.println("Sending status");
   DynamicJsonDocument doc(MQTT_MAX_PACKET_SIZE);
     char buffer[MQTT_MAX_PACKET_SIZE];
     doc["temperature"] = temperature;
@@ -144,21 +159,17 @@ void sendMqttStatus() {
 void mqttCallback(char *topic, byte *payload, unsigned int length){
   Serial.print("Message arrived in topic: ");
   Serial.println(topic);
-  Serial.print("Message:");
+  Serial.print("Message: ");
   String message;
   for (unsigned int i = 0; i < length; i++) {
       message = message + (char) payload[i];  // convert *byte to string
   }
-  Serial.print(message);
+  Serial.println(message);
   
   if (calibrationCmdTopic == topic) {
     calibration = message.toFloat();
-    EEPROM.put(ROOM_CALIBRATION_EEPROM_INDEX, calibration);
-    sendMqttStatus();
   } else if (frequencyCmdTopic == topic) {
     frequency = message.toInt();
-    EEPROM.put(ROOM_FREQUENCY_EEPROM_INDEX, frequency);
-    sendMqttStatus();
   } else {
     Serial.println("Invalid topic");
   }
@@ -176,18 +187,6 @@ void setup() {
   // Wait for serial to initialize.
   while(!Serial) { }
   Serial.println("start");
-
-  EEPROM.get(ROOM_CALIBRATION_EEPROM_INDEX, calibration);
-  EEPROM.get(ROOM_FREQUENCY_EEPROM_INDEX, frequency);
-  if (frequency < 1) {
-    frequency = 60;
-  }
-  /*if (tmp == NULL) {
-    Serial.println("EEPROM Has no stored calibration, storing 0.");
-    EEPROM.put(ROOM_CALIBRATION_EEPROM_INDEX, 0.0);
-  } else {
-    EEPROM.get(ROOM_CALIBRATION_EEPROM_INDEX, calibration);
-  }  */
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED) {
@@ -216,7 +215,7 @@ void setup() {
       Serial.println("Connected to MQTT");
 
       sendMQTTTemperatureDiscoveryMsg();
-      //sendMQTTHumidityDiscoveryMsg();
+      sendMQTTHumidityDiscoveryMsg();
       sendMQTTCalibrationDiscoveryMsg();
       sendMQTTFrequencyDiscoveryMsg();
       client.subscribe(calibrationCmdTopic.c_str());
@@ -230,6 +229,7 @@ void setup() {
     }
   }
 
+  Serial.println("Initializing sensor");
   if (sensor == BMP280) {
     bmp280.begin(BMP280_I2C_ALT_ADDR); 
   } else if (sensor == BME280) {
@@ -247,43 +247,46 @@ void setup() {
     } else {
       Serial.println("ERROR! Invalid sensor config.");
     }
+  } else if (sensor == DHTXX) {
+    dht.begin();
   }
 }
 
 void sendStatus() {
-  Serial.println();
-  Serial.print(temperature);                    // Display the results    
-  Serial.print(F("*C   "));
-  Serial.print(pressure);    
-  Serial.print(F("hPa   "));
-  Serial.print(altitude);
-  Serial.println(F("m   ")); 
-  Serial.print(humidity);
-  Serial.println(F("%")); 
-
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("Sending data...");
     sendMqttStatus();
   }
-  ESP.deepSleep(frequency*1e6);
 }
 
 void loop() {
-  client.loop();
   if (sensor == BMP280) {
     bmp280.startForcedConversion();
-    if (bmp280.getMeasurements(temperature, pressure, altitude)) {
-      temperature += calibration;
-      sendStatus();
-    }
+    sensorRead = bmp280.getMeasurements(temperature, pressure, altitude) == 1;
+    bmp280.stopConversion();
   } else if (sensor == BME280) {
-    temperature = bme.readTemperature() + calibration;
+    temperature = bme.readTemperature();
     pressure = bme.readPressure() / 100.0F;
     altitude = bme.readAltitude(SEALEVELPRESSURE_HPA);
     humidity = bme.readHumidity();
-    sendStatus();
+    sensorRead = true;
+  } else if (sensor == DHTXX) {
+    temperature = dht.readTemperature();
+    humidity = dht.readHumidity();
+    sensorRead = true;
   } else {
     Serial.println("ERROR! Invalid sensor config.");
   }
-  delay(10);
+
+  if (sensorRead && temperature > 0) {
+    // A little loop to ensure we receive all messages
+    for (int i=0;i<10;i++) {
+      client.loop();
+      delay(100);
+    }
+    temperature += calibration;
+    sendStatus();
+    delay(10);
+    ESP.deepSleep(frequency*DEEP_SLEEP_SECONDS);
+  }
 }
